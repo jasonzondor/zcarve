@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="100mm" viewBox="0 0 100 100">
+  <!-- Simple test shapes for v-carving -->
+  
+  <!-- Rectangle border -->
+  <rect id="border" x="5" y="5" width="90" height="90" 
+        fill="none" stroke="#0000ff" stroke-width="0.5"/>
+  
+  <!-- Star shape -->
+  <path id="star" 
+        d="M50,15 L58,35 L80,35 L62,48 L70,70 L50,55 L30,70 L38,48 L20,35 L42,35 Z"
+        fill="none" stroke="#ff0000" stroke-width="0.5"/>
+  
+  <!-- Circle -->
+  <circle id="circle" cx="50" cy="50" r="8" 
+          fill="none" stroke="#00ff00" stroke-width="0.5"/>
+  
+  <!-- Text path (letter Z) -->
+  <path id="letter-z"
+        d="M25,80 L35,80 L25,90 L35,90"
+        fill="none" stroke="#ff00ff" stroke-width="0.5"/>
+</svg>

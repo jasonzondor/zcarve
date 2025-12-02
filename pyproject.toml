@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "zcarve"
+version = "0.1.0"
+description = "G-code generator for v-carving inlays"
+readme = "README.md"
+authors = ["Jason"]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.14"
+PySide6 = "^6.6.0"
+svgpathtools = "^1.6.0"
+shapely = "^2.0.0"
+numpy = "^1.24.0"
+pyqtgraph = "^0.13.0"
+PyOpenGL = "^3.1.0"
+
+[tool.poetry.scripts]
+zcarve = "zcarve.main:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
