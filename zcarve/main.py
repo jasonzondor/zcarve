@@ -35,7 +35,7 @@ from PySide6.QtGui import QPainterPath
 
 from .geometry import SVGLoader, CarvePath
 from .tools import ToolLibrary
-from .dialogs import RoughingDialog, VBitDialog, ToolpathDialog
+from .dialogs import RoughingDialog, VBitDialog, ToolpathDialog, ToolLibraryDialog
 from .toolpaths import generate_roughing_toolpaths, generate_vbit_toolpaths, toolpaths_to_gcode
 from .inlay import generate_inlay_toolpaths, inlay_to_gcode, InlayPart
 
@@ -793,10 +793,8 @@ class MainWindow(QMainWindow):
     
     def show_tool_library(self):
         """Show tool library editor."""
-        # TODO: Implement tool library editor dialog
-        QMessageBox.information(
-            self, "Not Implemented", "Tool library editor coming soon"
-        )
+        dialog = ToolLibraryDialog(self.tool_library, self)
+        dialog.exec()
     
     def preview_roughing(self):
         """Preview roughing toolpaths without exporting."""
