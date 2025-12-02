@@ -12,7 +12,7 @@ G-code generator for v-carving inlays on GRBL-based CNC machines.
 ## Installation
 
 ```bash
-# Install dependencies with Poetry
+# Install dependencies with Poetry a
 poetry install
 ```
 
