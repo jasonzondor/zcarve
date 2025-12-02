@@ -694,3 +694,324 @@ class ToolpathDialog(QDialog):
 
 # Keep InlayDialog as alias for backward compatibility
 InlayDialog = ToolpathDialog
+
+
+class ToolLibraryDialog(QDialog):
+    """Dialog for managing the tool library."""
+    
+    def __init__(self, tool_library: ToolLibrary, parent=None):
+        super().__init__(parent)
+        self.tool_library = tool_library
+        self.setWindowTitle("Tool Library")
+        self.setMinimumSize(600, 400)
+        
+        self._setup_ui()
+        self._load_tools()
+    
+    def _setup_ui(self):
+        layout = QHBoxLayout(self)
+        
+        # Left side - tool list
+        left_layout = QVBoxLayout()
+        
+        self.tool_list = QListWidget()
+        self.tool_list.currentRowChanged.connect(self._on_tool_selected)
+        left_layout.addWidget(QLabel("Tools:"))
+        left_layout.addWidget(self.tool_list)
+        
+        # Buttons for add/remove
+        btn_layout = QHBoxLayout()
+        
+        self.add_endmill_btn = QPushButton("+ End Mill")
+        self.add_endmill_btn.clicked.connect(self._add_endmill)
+        btn_layout.addWidget(self.add_endmill_btn)
+        
+        self.add_vbit_btn = QPushButton("+ V-Bit")
+        self.add_vbit_btn.clicked.connect(self._add_vbit)
+        btn_layout.addWidget(self.add_vbit_btn)
+        
+        self.delete_btn = QPushButton("Delete")
+        self.delete_btn.clicked.connect(self._delete_tool)
+        self.delete_btn.setEnabled(False)
+        btn_layout.addWidget(self.delete_btn)
+        
+        left_layout.addLayout(btn_layout)
+        layout.addLayout(left_layout)
+        
+        # Right side - tool details
+        self.details_group = QGroupBox("Tool Details")
+        self.details_layout = QFormLayout(self.details_group)
+        
+        # Common fields
+        self.id_edit = QLineEdit()
+        self.id_edit.setReadOnly(True)
+        self.details_layout.addRow("ID:", self.id_edit)
+        
+        self.name_edit = QLineEdit()
+        self.name_edit.textChanged.connect(self._on_field_changed)
+        self.details_layout.addRow("Name:", self.name_edit)
+        
+        self.diameter_spin = QDoubleSpinBox()
+        self.diameter_spin.setRange(0.1, 50.0)
+        self.diameter_spin.setDecimals(3)
+        self.diameter_spin.setSuffix(" mm")
+        self.diameter_spin.valueChanged.connect(self._on_field_changed)
+        self.details_layout.addRow("Diameter:", self.diameter_spin)
+        
+        self.feed_spin = QDoubleSpinBox()
+        self.feed_spin.setRange(1, 10000)
+        self.feed_spin.setDecimals(0)
+        self.feed_spin.setSuffix(" mm/min")
+        self.feed_spin.valueChanged.connect(self._on_field_changed)
+        self.details_layout.addRow("Feed Rate:", self.feed_spin)
+        
+        self.plunge_spin = QDoubleSpinBox()
+        self.plunge_spin.setRange(1, 5000)
+        self.plunge_spin.setDecimals(0)
+        self.plunge_spin.setSuffix(" mm/min")
+        self.plunge_spin.valueChanged.connect(self._on_field_changed)
+        self.details_layout.addRow("Plunge Rate:", self.plunge_spin)
+        
+        self.rpm_spin = QSpinBox()
+        self.rpm_spin.setRange(1000, 30000)
+        self.rpm_spin.setSuffix(" RPM")
+        self.rpm_spin.valueChanged.connect(self._on_field_changed)
+        self.details_layout.addRow("Spindle:", self.rpm_spin)
+        
+        # End mill specific
+        self.flute_spin = QSpinBox()
+        self.flute_spin.setRange(1, 8)
+        self.flute_spin.valueChanged.connect(self._on_field_changed)
+        self.flute_label = QLabel("Flutes:")
+        self.details_layout.addRow(self.flute_label, self.flute_spin)
+        
+        self.stepover_spin = QDoubleSpinBox()
+        self.stepover_spin.setRange(1, 100)
+        self.stepover_spin.setDecimals(0)
+        self.stepover_spin.setSuffix(" %")
+        self.stepover_spin.valueChanged.connect(self._on_field_changed)
+        self.stepover_label = QLabel("Stepover:")
+        self.details_layout.addRow(self.stepover_label, self.stepover_spin)
+        
+        self.depth_spin = QDoubleSpinBox()
+        self.depth_spin.setRange(0.1, 20.0)
+        self.depth_spin.setDecimals(2)
+        self.depth_spin.setSuffix(" mm")
+        self.depth_spin.valueChanged.connect(self._on_field_changed)
+        self.depth_label = QLabel("Max Depth/Pass:")
+        self.details_layout.addRow(self.depth_label, self.depth_spin)
+        
+        # V-bit specific
+        self.angle_spin = QDoubleSpinBox()
+        self.angle_spin.setRange(10, 180)
+        self.angle_spin.setDecimals(1)
+        self.angle_spin.setSuffix("°")
+        self.angle_spin.valueChanged.connect(self._on_field_changed)
+        self.angle_label = QLabel("Angle:")
+        self.details_layout.addRow(self.angle_label, self.angle_spin)
+        
+        self.tip_spin = QDoubleSpinBox()
+        self.tip_spin.setRange(0, 10)
+        self.tip_spin.setDecimals(2)
+        self.tip_spin.setSuffix(" mm")
+        self.tip_spin.valueChanged.connect(self._on_field_changed)
+        self.tip_label = QLabel("Tip Diameter:")
+        self.details_layout.addRow(self.tip_label, self.tip_spin)
+        
+        # Save button
+        self.save_btn = QPushButton("Save Changes")
+        self.save_btn.clicked.connect(self._save_tool)
+        self.save_btn.setEnabled(False)
+        self.details_layout.addRow(self.save_btn)
+        
+        # Close button under Save
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        self.details_layout.addRow(close_btn)
+        
+        layout.addWidget(self.details_group)
+        
+        # Initially hide details
+        self.details_group.setEnabled(False)
+        self._current_tool = None
+        self._modified = False
+    
+    def _load_tools(self):
+        """Load tools into the list."""
+        self.tool_list.clear()
+        
+        for tool in self.tool_library.get_endmills():
+            item = QListWidgetItem(f"🔧 {tool.name}")
+            item.setData(Qt.ItemDataRole.UserRole, tool)
+            self.tool_list.addItem(item)
+        
+        for tool in self.tool_library.get_vbits():
+            item = QListWidgetItem(f"🔺 {tool.name}")
+            item.setData(Qt.ItemDataRole.UserRole, tool)
+            self.tool_list.addItem(item)
+    
+    def _on_tool_selected(self, row):
+        """Handle tool selection."""
+        if row < 0:
+            self.details_group.setEnabled(False)
+            self.delete_btn.setEnabled(False)
+            self._current_tool = None
+            return
+        
+        item = self.tool_list.item(row)
+        tool = item.data(Qt.ItemDataRole.UserRole)
+        self._current_tool = tool
+        self.details_group.setEnabled(True)
+        self.delete_btn.setEnabled(True)
+        
+        # Populate fields
+        self._loading = True
+        self.id_edit.setText(tool.id)
+        self.name_edit.setText(tool.name)
+        self.diameter_spin.setValue(tool.diameter)
+        self.feed_spin.setValue(tool.feed_rate)
+        self.plunge_spin.setValue(tool.plunge_rate)
+        self.rpm_spin.setValue(tool.spindle_rpm)
+        
+        # Show/hide type-specific fields
+        is_endmill = isinstance(tool, EndMill)
+        
+        self.flute_label.setVisible(is_endmill)
+        self.flute_spin.setVisible(is_endmill)
+        self.stepover_label.setVisible(is_endmill)
+        self.stepover_spin.setVisible(is_endmill)
+        self.depth_label.setVisible(is_endmill)
+        self.depth_spin.setVisible(is_endmill)
+        
+        self.angle_label.setVisible(not is_endmill)
+        self.angle_spin.setVisible(not is_endmill)
+        self.tip_label.setVisible(not is_endmill)
+        self.tip_spin.setVisible(not is_endmill)
+        
+        if is_endmill:
+            self.flute_spin.setValue(tool.flute_count)
+            self.stepover_spin.setValue(tool.stepover_percent)
+            self.depth_spin.setValue(tool.max_depth_per_pass)
+        else:
+            self.angle_spin.setValue(tool.angle)
+            self.tip_spin.setValue(tool.tip_diameter)
+        
+        self._loading = False
+        self._modified = False
+        self.save_btn.setEnabled(False)
+    
+    def _on_field_changed(self):
+        """Mark as modified when a field changes."""
+        if hasattr(self, '_loading') and self._loading:
+            return
+        self._modified = True
+        self.save_btn.setEnabled(True)
+    
+    def _save_tool(self):
+        """Save the current tool."""
+        if not self._current_tool:
+            return
+        
+        if isinstance(self._current_tool, EndMill):
+            tool = EndMill(
+                id=self._current_tool.id,
+                name=self.name_edit.text(),
+                diameter=self.diameter_spin.value(),
+                feed_rate=self.feed_spin.value(),
+                plunge_rate=self.plunge_spin.value(),
+                spindle_rpm=self.rpm_spin.value(),
+                flute_count=self.flute_spin.value(),
+                stepover_percent=self.stepover_spin.value(),
+                max_depth_per_pass=self.depth_spin.value(),
+            )
+        else:
+            tool = VBit(
+                id=self._current_tool.id,
+                name=self.name_edit.text(),
+                diameter=self.diameter_spin.value(),
+                feed_rate=self.feed_spin.value(),
+                plunge_rate=self.plunge_spin.value(),
+                spindle_rpm=self.rpm_spin.value(),
+                angle=self.angle_spin.value(),
+                tip_diameter=self.tip_spin.value(),
+            )
+        
+        self.tool_library.add(tool)
+        self._current_tool = tool
+        self._modified = False
+        self.save_btn.setEnabled(False)
+        
+        # Update list item
+        row = self.tool_list.currentRow()
+        item = self.tool_list.item(row)
+        prefix = "🔧" if isinstance(tool, EndMill) else "🔺"
+        item.setText(f"{prefix} {tool.name}")
+        item.setData(Qt.ItemDataRole.UserRole, tool)
+    
+    def _add_endmill(self):
+        """Add a new end mill."""
+        # Generate unique ID
+        import time
+        new_id = f"em-{int(time.time())}"
+        
+        tool = EndMill(
+            id=new_id,
+            name="New End Mill",
+            diameter=6.0,
+            feed_rate=1000.0,
+            plunge_rate=300.0,
+            spindle_rpm=12000,
+        )
+        self.tool_library.add(tool)
+        self._load_tools()
+        
+        # Select the new tool
+        for i in range(self.tool_list.count()):
+            item = self.tool_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole).id == new_id:
+                self.tool_list.setCurrentRow(i)
+                break
+    
+    def _add_vbit(self):
+        """Add a new V-bit."""
+        import time
+        new_id = f"vb-{int(time.time())}"
+        
+        tool = VBit(
+            id=new_id,
+            name="New V-Bit",
+            diameter=12.0,
+            feed_rate=500.0,
+            plunge_rate=150.0,
+            spindle_rpm=12000,
+            angle=60.0,
+        )
+        self.tool_library.add(tool)
+        self._load_tools()
+        
+        # Select the new tool
+        for i in range(self.tool_list.count()):
+            item = self.tool_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole).id == new_id:
+                self.tool_list.setCurrentRow(i)
+                break
+    
+    def _delete_tool(self):
+        """Delete the selected tool."""
+        if not self._current_tool:
+            return
+        
+        reply = QMessageBox.question(
+            self, "Confirm Delete",
+            f"Delete tool '{self._current_tool.name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self.tool_library.remove(self._current_tool.id)
+            self._current_tool = None
+            self._load_tools()
+
+
+# Need to import QListWidget and QLineEdit
+from PySide6.QtWidgets import QListWidget, QListWidgetItem, QLineEdit

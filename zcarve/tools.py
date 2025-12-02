@@ -1,7 +1,7 @@
 """Tool library management for end mills and v-bits."""
 
-import json
-from dataclasses import dataclass, field, asdict
+import sqlite3
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -31,10 +31,6 @@ class EndMill:
         """Calculate stepover distance in mm."""
         return self.diameter * (self.stepover_percent / 100.0)
     
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        d["tool_type"] = self.tool_type.value
-        return d
 
 
 @dataclass
@@ -58,133 +54,176 @@ class VBit:
         if effective_width <= 0:
             return 0.0
         return (effective_width / 2) / math.tan(half_angle)
-    
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        d["tool_type"] = self.tool_type.value
-        return d
 
 
 # Type alias for any tool
 Tool = EndMill | VBit
 
 
-def tool_from_dict(data: dict) -> Tool:
-    """Create a tool from a dictionary."""
-    data = data.copy()
-    tool_type = ToolType(data.pop("tool_type"))
-    
-    if tool_type == ToolType.ENDMILL:
-        return EndMill(**data, tool_type=tool_type)
-    elif tool_type == ToolType.VBIT:
-        return VBit(**data, tool_type=tool_type)
-    raise ValueError(f"Unknown tool type: {tool_type}")
-
-
 class ToolLibrary:
-    """Persistent storage for tools."""
+    """SQLite-based persistent storage for tools."""
     
-    DEFAULT_TOOLS = [
-        EndMill(
-            id="em-6mm-2f",
-            name="6mm 2-Flute End Mill",
-            diameter=6.0,
-            feed_rate=1000.0,
-            plunge_rate=300.0,
-            spindle_rpm=12000,
-            flute_count=2,
-            stepover_percent=40.0,
-            max_depth_per_pass=2.0,
-        ),
-        EndMill(
-            id="em-3mm-2f",
-            name="3mm 2-Flute End Mill",
-            diameter=3.0,
-            feed_rate=800.0,
-            plunge_rate=200.0,
-            spindle_rpm=15000,
-            flute_count=2,
-            stepover_percent=40.0,
-            max_depth_per_pass=1.5,
-        ),
-        VBit(
-            id="vb-60deg",
-            name="60° V-Bit",
-            diameter=12.0,
-            feed_rate=600.0,
-            plunge_rate=150.0,
-            spindle_rpm=12000,
-            angle=60.0,
-            tip_diameter=0.0,
-        ),
-        VBit(
-            id="vb-90deg",
-            name="90° V-Bit",
-            diameter=12.0,
-            feed_rate=500.0,
-            plunge_rate=120.0,
-            spindle_rpm=10000,
-            angle=90.0,
-            tip_diameter=0.0,
-        ),
+    DEFAULT_ENDMILLS = [
+        ("em-6mm-2f", "6mm 2-Flute End Mill", 6.0, 1000.0, 300.0, 12000, 2, 40.0, 2.0),
+        ("em-3mm-2f", "3mm 2-Flute End Mill", 3.0, 800.0, 200.0, 15000, 2, 40.0, 1.5),
     ]
     
-    def __init__(self, library_path: Optional[Path] = None):
-        if library_path is None:
+    DEFAULT_VBITS = [
+        ("vb-60deg", "60° V-Bit", 12.0, 600.0, 150.0, 12000, 60.0, 0.0),
+        ("vb-90deg", "90° V-Bit", 12.0, 500.0, 120.0, 10000, 90.0, 0.0),
+    ]
+    
+    def __init__(self, db_path: Optional[Path] = None):
+        if db_path is None:
             config_dir = Path.home() / ".config" / "zcarve"
             config_dir.mkdir(parents=True, exist_ok=True)
-            library_path = config_dir / "tools.json"
+            db_path = config_dir / "tools.db"
         
-        self.library_path = library_path
-        self.tools: dict[str, Tool] = {}
-        self.load()
+        self.db_path = db_path
+        self._init_db()
     
-    def load(self) -> None:
-        """Load tools from disk, or initialize with defaults."""
-        if self.library_path.exists():
-            try:
-                with open(self.library_path, "r") as f:
-                    data = json.load(f)
-                    for tool_data in data.get("tools", []):
-                        tool = tool_from_dict(tool_data)
-                        self.tools[tool.id] = tool
-            except (json.JSONDecodeError, KeyError) as e:
-                print(f"Warning: Could not load tool library: {e}")
-                self._init_defaults()
-        else:
-            self._init_defaults()
+    def _get_conn(self) -> sqlite3.Connection:
+        """Get a database connection."""
+        return sqlite3.connect(self.db_path)
     
-    def _init_defaults(self) -> None:
-        """Initialize with default tools."""
-        for tool in self.DEFAULT_TOOLS:
-            self.tools[tool.id] = tool
-        self.save()
-    
-    def save(self) -> None:
-        """Persist tools to disk."""
-        data = {"tools": [tool.to_dict() for tool in self.tools.values()]}
-        with open(self.library_path, "w") as f:
-            json.dump(data, f, indent=2)
+    def _init_db(self) -> None:
+        """Initialize database schema and default tools."""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            
+            # Create endmills table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS endmills (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    diameter REAL NOT NULL,
+                    feed_rate REAL NOT NULL,
+                    plunge_rate REAL NOT NULL,
+                    spindle_rpm INTEGER NOT NULL,
+                    flute_count INTEGER DEFAULT 2,
+                    stepover_percent REAL DEFAULT 40.0,
+                    max_depth_per_pass REAL DEFAULT 2.0
+                )
+            """)
+            
+            # Create vbits table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS vbits (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    diameter REAL NOT NULL,
+                    feed_rate REAL NOT NULL,
+                    plunge_rate REAL NOT NULL,
+                    spindle_rpm INTEGER NOT NULL,
+                    angle REAL DEFAULT 60.0,
+                    tip_diameter REAL DEFAULT 0.0
+                )
+            """)
+            
+            # Insert defaults if tables are empty
+            cursor.execute("SELECT COUNT(*) FROM endmills")
+            if cursor.fetchone()[0] == 0:
+                cursor.executemany("""
+                    INSERT INTO endmills 
+                    (id, name, diameter, feed_rate, plunge_rate, spindle_rpm, flute_count, stepover_percent, max_depth_per_pass)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, self.DEFAULT_ENDMILLS)
+            
+            cursor.execute("SELECT COUNT(*) FROM vbits")
+            if cursor.fetchone()[0] == 0:
+                cursor.executemany("""
+                    INSERT INTO vbits 
+                    (id, name, diameter, feed_rate, plunge_rate, spindle_rpm, angle, tip_diameter)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, self.DEFAULT_VBITS)
+            
+            conn.commit()
     
     def add(self, tool: Tool) -> None:
         """Add or update a tool."""
-        self.tools[tool.id] = tool
-        self.save()
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            
+            if isinstance(tool, EndMill):
+                cursor.execute("""
+                    INSERT OR REPLACE INTO endmills 
+                    (id, name, diameter, feed_rate, plunge_rate, spindle_rpm, flute_count, stepover_percent, max_depth_per_pass)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (tool.id, tool.name, tool.diameter, tool.feed_rate, tool.plunge_rate,
+                      tool.spindle_rpm, tool.flute_count, tool.stepover_percent, tool.max_depth_per_pass))
+            elif isinstance(tool, VBit):
+                cursor.execute("""
+                    INSERT OR REPLACE INTO vbits 
+                    (id, name, diameter, feed_rate, plunge_rate, spindle_rpm, angle, tip_diameter)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (tool.id, tool.name, tool.diameter, tool.feed_rate, tool.plunge_rate,
+                      tool.spindle_rpm, tool.angle, tool.tip_diameter))
+            
+            conn.commit()
     
     def remove(self, tool_id: str) -> None:
         """Remove a tool by ID."""
-        if tool_id in self.tools:
-            del self.tools[tool_id]
-            self.save()
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM endmills WHERE id = ?", (tool_id,))
+            cursor.execute("DELETE FROM vbits WHERE id = ?", (tool_id,))
+            conn.commit()
     
     def get(self, tool_id: str) -> Optional[Tool]:
         """Get a tool by ID."""
-        return self.tools.get(tool_id)
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            
+            # Check endmills
+            cursor.execute("SELECT * FROM endmills WHERE id = ?", (tool_id,))
+            row = cursor.fetchone()
+            if row:
+                return EndMill(
+                    id=row[0], name=row[1], diameter=row[2], feed_rate=row[3],
+                    plunge_rate=row[4], spindle_rpm=row[5], flute_count=row[6],
+                    stepover_percent=row[7], max_depth_per_pass=row[8]
+                )
+            
+            # Check vbits
+            cursor.execute("SELECT * FROM vbits WHERE id = ?", (tool_id,))
+            row = cursor.fetchone()
+            if row:
+                return VBit(
+                    id=row[0], name=row[1], diameter=row[2], feed_rate=row[3],
+                    plunge_rate=row[4], spindle_rpm=row[5], angle=row[6],
+                    tip_diameter=row[7]
+                )
+            
+            return None
     
     def get_endmills(self) -> list[EndMill]:
         """Get all end mills."""
-        return [t for t in self.tools.values() if isinstance(t, EndMill)]
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM endmills ORDER BY name")
+            return [
+                EndMill(
+                    id=row[0], name=row[1], diameter=row[2], feed_rate=row[3],
+                    plunge_rate=row[4], spindle_rpm=row[5], flute_count=row[6],
+                    stepover_percent=row[7], max_depth_per_pass=row[8]
+                )
+                for row in cursor.fetchall()
+            ]
     
     def get_vbits(self) -> list[VBit]:
         """Get all v-bits."""
-        return [t for t in self.tools.values() if isinstance(t, VBit)]
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM vbits ORDER BY name")
+            return [
+                VBit(
+                    id=row[0], name=row[1], diameter=row[2], feed_rate=row[3],
+                    plunge_rate=row[4], spindle_rpm=row[5], angle=row[6],
+                    tip_diameter=row[7]
+                )
+                for row in cursor.fetchall()
+            ]
+    
+    def get_all(self) -> list[Tool]:
+        """Get all tools."""
+        return self.get_endmills() + self.get_vbits()
