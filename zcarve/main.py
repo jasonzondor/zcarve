@@ -68,6 +68,12 @@ class GLToolpathView(gl.GLViewWidget):
         self._vbit: list = []
         self._design_paths: list = []
         self._center = (0, 0)
+        self._stock_size = None  # (width, height, depth)
+    
+    def set_stock_size(self, width: float, height: float, depth: float):
+        """Set stock dimensions for visualization."""
+        self._stock_size = (width, height, depth)
+        self._redraw()
     
     def mousePressEvent(self, ev):
         """Handle mouse press - track position."""
@@ -172,6 +178,10 @@ class GLToolpathView(gl.GLViewWidget):
         # Draw v-bit (orange)
         for tp in self._vbit:
             self._draw_toolpath(tp, (1, 0.5, 0.2, 0.9), cx, cy)
+        
+        # Draw stock boundary (if set)
+        if self._stock_size:
+            self._draw_stock_boundary(cx, cy)
     
     def _draw_toolpath(self, tp, color: tuple, cx: float, cy: float):
         """Draw a single toolpath."""
@@ -192,6 +202,30 @@ class GLToolpathView(gl.GLViewWidget):
         
         self.addItem(gl.GLLinePlotItem(
             pos=line_pts, color=color, width=1.5, antialias=True
+        ))
+    
+    def _draw_stock_boundary(self, cx: float, cy: float):
+        """Draw stock boundary as a 3D wireframe box."""
+        w, h, d = self._stock_size
+        hw, hh = w / 2, h / 2  # Half dimensions
+        
+        # Stock center is at (w/2, h/2) in world coords
+        # Toolpaths are offset by -cx, -cy to center them
+        # So stock center after same offset is at (w/2 - cx, h/2 - cy)
+        stock_cx = hw - cx
+        stock_cy = hh - cy
+        
+        top = np.array([
+            [stock_cx - hw, stock_cy - hh, 0],
+            [stock_cx + hw, stock_cy - hh, 0],
+            [stock_cx + hw, stock_cy + hh, 0],
+            [stock_cx - hw, stock_cy + hh, 0],
+            [stock_cx - hw, stock_cy - hh, 0],  # Close the loop
+        ])
+        
+        # Draw top edge (brown)
+        self.addItem(gl.GLLinePlotItem(
+            pos=top, color=(0.6, 0.4, 0.2, 0.8), width=2, antialias=True
         ))
 
 
@@ -226,10 +260,13 @@ class DesignView3D(QWidget):
         self._pocket_vbit: list = []
         self._plug_roughing: list = []
         self._plug_vbit: list = []
+        self._stock_size = (100, 100, 20)  # Default
     
-    def update_stock(self, width: float, height: float):
+    def update_stock(self, width: float, height: float, depth: float = 20.0):
         """Update stock dimensions."""
-        pass
+        self._stock_size = (width, height, depth)
+        # Update plug view with stock size
+        self.plug_view.set_stock_size(width, height, depth)
     
     def display_paths(self, paths: list[CarvePath]):
         """Display design paths."""
@@ -336,7 +373,7 @@ class MainWindow(QMainWindow):
         """Set up the main UI layout."""
         # Central widget - 3D design view
         self.design_view = DesignView3D()
-        self.design_view.update_stock(self.stock_x, self.stock_y)
+        self.design_view.update_stock(self.stock_x, self.stock_y, self.stock_z)
         self.setCentralWidget(self.design_view)
     
     def _setup_menus(self):
@@ -512,7 +549,7 @@ class MainWindow(QMainWindow):
         self.stock_x = self.stock_x_spin.value()
         self.stock_y = self.stock_y_spin.value()
         self.stock_z = self.stock_z_spin.value()
-        self.design_view.update_stock(self.stock_x, self.stock_y)
+        self.design_view.update_stock(self.stock_x, self.stock_y, self.stock_z)
     
     def _on_origin_changed(self):
         """Handle origin position change."""

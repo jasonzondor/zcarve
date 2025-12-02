@@ -192,44 +192,129 @@ def _generate_plug(
     if clearance_area.is_empty:
         return [], []
     
-    # Convert clearance area to CarvePath(s)
-    clearance_paths = []
+    # Generate plug clearing toolpaths with TAPERED profile
+    # The plug must be narrower at top, wider at bottom to match pocket V-groove
+    # At each depth, account for how wide the V-bit will cut
     
-    def poly_to_path(poly, idx):
-        """Convert a polygon to CarvePath."""
-        coords = np.array(poly.exterior.coords)
-        return CarvePath(
-            id=f"plug_clearance_{idx}",
-            points=coords,
-            is_closed=True,
-        )
+    import math
     
-    if hasattr(clearance_area, 'geoms'):
-        # MultiPolygon
-        for i, geom in enumerate(clearance_area.geoms):
-            clearance_paths.append(poly_to_path(geom, i))
-    else:
-        # Single Polygon
-        clearance_paths.append(poly_to_path(clearance_area, 0))
+    tool_diameter = params.roughing_tool.diameter
+    stepover = tool_diameter * 0.4  # 40% stepover
+    tool_radius = tool_diameter / 2
     
-    # Generate roughing for clearance area
-    roughing_params = RoughingParams(
-        tool=params.roughing_tool,
-        target_depth=plug_total_depth,
-        stock_to_leave=params.stock_to_leave,
-        climb_milling=params.climb_milling,
-        strategy=params.clearing_strategy,
-    )
-    roughing_toolpaths = generate_roughing_toolpaths(clearance_paths, roughing_params)
+    # V-bit geometry - determines taper angle
+    vbit_half_angle = math.radians(params.vbit_tool.angle / 2)
+    tan_half = math.tan(vbit_half_angle)
     
-    # V-bit finishing along the design edges (mirrored paths)
-    vbit_params = VBitParams(
-        tool=params.vbit_tool,
-        max_depth=plug_total_depth,
-        roughing_diameter=params.roughing_tool.diameter,
-        climb_milling=params.climb_milling,
-    )
-    vbit_toolpaths = generate_vbit_toolpaths(mirrored_paths, vbit_params)
+    # Calculate depth passes  
+    depth_per_pass = 1.5  # mm per pass
+    num_passes = max(1, int(np.ceil(plug_total_depth / depth_per_pass)))
+    
+    roughing_toolpaths = []
+    
+    for pass_num in range(num_passes):
+        z_depth = -min((pass_num + 1) * depth_per_pass, plug_total_depth)
+        current_depth = abs(z_depth)
+        
+        # At this depth, the V-bit will cut this far from the design edge
+        # So the roughing must stay further from the design at deeper cuts
+        vbit_width_at_depth = current_depth / tan_half
+        
+        # Minimum distance from design edge at this depth
+        min_clearance = tool_radius + params.stock_to_leave + vbit_width_at_depth
+        
+        # Start from outer boundary, work inward toward the design
+        current_inset = tool_radius
+        
+        while True:
+            # Inset from outer box
+            inner_box = outer_box.buffer(-current_inset)
+            if inner_box.is_empty:
+                break
+            
+            # The cutting path is the inner_box minus the design (with depth-dependent clearance)
+            design_with_clearance = design_union.buffer(min_clearance)
+            ring = inner_box.difference(design_with_clearance)
+            
+            if ring.is_empty:
+                break
+            
+            def add_ring_path(geom):
+                if hasattr(geom, 'exterior'):
+                    coords = np.array(geom.exterior.coords)
+                    # Reverse for climb milling
+                    if params.climb_milling:
+                        coords = coords[::-1]
+                    roughing_toolpaths.append(Toolpath(
+                        points=coords,
+                        z_depth=z_depth,
+                        is_rapid=False,
+                    ))
+            
+            if hasattr(ring, 'geoms'):
+                for g in ring.geoms:
+                    add_ring_path(g)
+            elif hasattr(ring, 'exterior'):
+                add_ring_path(ring)
+            
+            current_inset += stepover
+            
+            # Stop when we've reached the design boundary
+            if current_inset > border:
+                break
+    
+    # V-bit finishing for plug - creates tapered edge on OUTSIDE of design
+    # The V-bit starts at design edge (Z=0) and cuts outward with increasing depth
+    # At offset distance d from edge, Z depth = -d * tan(half_angle)
+    
+    vbit_toolpaths = []
+    
+    # V-bit step size (how far to move outward between passes)
+    vbit_stepover = 0.3  # mm - small steps for smooth finish
+    
+    # Maximum offset based on max depth
+    max_offset = plug_total_depth * tan_half
+    
+    current_offset = 0
+    while current_offset <= max_offset:
+        # Calculate Z depth at this offset
+        if current_offset == 0:
+            z_depth = 0  # Start at surface on the design edge
+        else:
+            z_depth = -current_offset / tan_half
+        
+        # Don't go deeper than plug depth
+        if abs(z_depth) > plug_total_depth:
+            z_depth = -plug_total_depth
+        
+        # Create offset polygon from design
+        if current_offset == 0:
+            offset_poly = design_union
+        else:
+            offset_poly = design_union.buffer(current_offset)
+        
+        if offset_poly.is_empty:
+            break
+        
+        def add_vbit_path(geom):
+            if hasattr(geom, 'exterior'):
+                coords = np.array(geom.exterior.coords)
+                # For plug V-bit cutting outward, use CW for climb milling
+                if not params.climb_milling:
+                    coords = coords[::-1]
+                vbit_toolpaths.append(Toolpath(
+                    points=coords,
+                    z_depth=z_depth,
+                    is_rapid=False,
+                ))
+        
+        if hasattr(offset_poly, 'geoms'):
+            for g in offset_poly.geoms:
+                add_vbit_path(g)
+        elif hasattr(offset_poly, 'exterior'):
+            add_vbit_path(offset_poly)
+        
+        current_offset += vbit_stepover
     
     return roughing_toolpaths, vbit_toolpaths
 
