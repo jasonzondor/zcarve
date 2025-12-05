@@ -179,6 +179,9 @@ def _generate_adaptive_level(
     
     Decomposes the pocket into center region + arm regions.
     Returns separate segments for safe Z retracts between them.
+    
+    For MultiPolygon inputs (multiple disconnected shapes), processes
+    each shape separately to ensure proper Z retracts between them.
     """
     import math
     
@@ -187,6 +190,41 @@ def _generate_adaptive_level(
     
     # Safe cutting area
     safe_area = polygon.buffer(-tool_radius, join_style=1, resolution=16)
+    if safe_area.is_empty:
+        return []
+    
+    # If we have multiple disconnected regions, process each separately
+    if isinstance(safe_area, MultiPolygon):
+        all_segments = []
+        for geom in safe_area.geoms:
+            if not geom.is_empty:
+                region_segments = _generate_adaptive_level_single(
+                    geom, stepover, tool_diameter, climb_milling,
+                    tool_radius, min_radius
+                )
+                all_segments.extend(region_segments)
+        return all_segments
+    
+    return _generate_adaptive_level_single(
+        safe_area, stepover, tool_diameter, climb_milling,
+        tool_radius, min_radius
+    )
+
+
+def _generate_adaptive_level_single(
+    safe_area: Polygon,
+    stepover: float,
+    tool_diameter: float,
+    climb_milling: bool,
+    tool_radius: float,
+    min_radius: float,
+) -> list[list[tuple[float, float]]]:
+    """Generate adaptive HSM path for a single connected region.
+    
+    This is the inner implementation that handles a single Polygon.
+    """
+    import math
+    
     if safe_area.is_empty:
         return []
     
@@ -199,10 +237,7 @@ def _generate_adaptive_level(
     
     # Find max radius for center (distance to nearest boundary)
     center_pt = Point(cx, cy)
-    if isinstance(safe_area, Polygon):
-        max_center_radius = safe_area.exterior.distance(center_pt)
-    else:
-        max_center_radius = min(p.exterior.distance(center_pt) for p in safe_area.geoms)
+    max_center_radius = safe_area.exterior.distance(center_pt)
     
     # PHASE 1: Clear center with circular spiral (separate segment)
     if max_center_radius > min_radius:
@@ -231,7 +266,7 @@ def _generate_adaptive_level(
                 continue
             
             arm_pts = _clear_arm_with_circles(
-                arm, polygon, cx, cy, tool_radius, min_radius, stepover, 
+                arm, safe_area, cx, cy, tool_radius, min_radius, stepover, 
                 pts_per_circle, climb_milling, max_center_radius
             )
             if arm_pts:
@@ -435,9 +470,21 @@ def _clear_arm_with_circles(
         if isinstance(contour, Polygon):
             coords = list(contour.exterior.coords)
         elif isinstance(contour, MultiPolygon):
-            coords = []
+            # For MultiPolygon, process each polygon separately
+            # and find the one closest to current position
+            best_coords = None
+            best_dist = float('inf')
             for p in contour.geoms:
-                coords.extend(list(p.exterior.coords))
+                p_coords = list(p.exterior.coords)
+                if points and p_coords:
+                    dist = ((p_coords[0][0] - points[-1][0])**2 + 
+                            (p_coords[0][1] - points[-1][1])**2)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_coords = p_coords
+                elif not best_coords:
+                    best_coords = p_coords
+            coords = best_coords if best_coords else []
         else:
             continue
         
@@ -1667,6 +1714,9 @@ def _generate_contour_level(
     
     Uses morphological smoothing to round sharp corners,
     then generates offset contours that flow smoothly.
+    
+    For MultiPolygon inputs (disconnected regions), generates separate
+    toolpaths for each region to ensure proper Z retracts between them.
     """
     # Heavy morphological smoothing - round ALL corners
     smooth_amount = stepover * 2.0
@@ -1680,10 +1730,38 @@ def _generate_contour_level(
     if smoothed.is_empty:
         return []
     
-    # Generate offset contours from the smoothed shape
+    # If we have multiple disconnected regions, process each separately
+    # to ensure proper Z retracts between them
+    if isinstance(smoothed, MultiPolygon):
+        all_toolpaths = []
+        for geom in smoothed.geoms:
+            if not geom.is_empty:
+                region_toolpaths = _generate_contour_level_single(
+                    geom, stepover, z_depth, climb_milling
+                )
+                all_toolpaths.extend(region_toolpaths)
+        return all_toolpaths
+    
+    return _generate_contour_level_single(smoothed, stepover, z_depth, climb_milling)
+
+
+def _generate_contour_level_single(
+    polygon: Polygon,
+    stepover: float,
+    z_depth: float,
+    climb_milling: bool,
+) -> list[Toolpath]:
+    """Generate contour toolpaths for a single connected region.
+    
+    This is the inner implementation that handles a single Polygon.
+    """
+    if polygon.is_empty:
+        return []
+    
+    # Generate offset contours from the shape
     effective_stepover = stepover * 0.8
     contours = []
-    current = smoothed
+    current = polygon
     
     while not current.is_empty:
         contours.append(current)
@@ -1701,12 +1779,36 @@ def _generate_contour_level(
     all_points = []
     
     for contour in contours:
+        # Extract coordinates from polygon(s)
         if isinstance(contour, Polygon):
             coords = list(contour.exterior.coords)
         elif isinstance(contour, MultiPolygon):
+            # For MultiPolygon, collect all exterior coords
+            # Order by proximity to last point to minimize jumps
+            polys = list(contour.geoms)
             coords = []
-            for p in contour.geoms:
-                coords.extend(list(p.exterior.coords))
+            while polys:
+                if all_points or coords:
+                    # Find polygon closest to current position
+                    ref_pt = coords[-1] if coords else all_points[-1]
+                    best_idx = 0
+                    best_dist = float('inf')
+                    for i, p in enumerate(polys):
+                        p_coords = list(p.exterior.coords)
+                        if p_coords:
+                            dist = (p_coords[0][0] - ref_pt[0])**2 + (p_coords[0][1] - ref_pt[1])**2
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_idx = i
+                    p = polys.pop(best_idx)
+                else:
+                    p = polys.pop(0)
+                
+                p_coords = list(p.exterior.coords)
+                if coords or all_points:
+                    ref = coords[-1] if coords else all_points[-1]
+                    p_coords = _reorder_ring_nearest(p_coords, ref)
+                coords.extend(p_coords)
         else:
             continue
         
@@ -1723,6 +1825,9 @@ def _generate_contour_level(
     
     toolpaths = []
     if len(all_points) >= 2:
+        # Create a single continuous toolpath
+        # The splitting for disconnected regions is handled at the 
+        # _generate_contour_level level by checking for MultiPolygon input
         toolpaths.append(Toolpath(
             points=np.array(all_points),
             z_depth=z_depth,

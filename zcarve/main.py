@@ -69,6 +69,7 @@ class GLToolpathView(gl.GLViewWidget):
         self._design_paths: list = []
         self._center = (0, 0)
         self._stock_size = None  # (width, height, depth)
+        self._safe_z = 5.0  # Safe Z height for rapids
     
     def set_stock_size(self, width: float, height: float, depth: float):
         """Set stock dimensions for visualization."""
@@ -171,17 +172,218 @@ class GLToolpathView(gl.GLViewWidget):
                     pos=line_pts, color=(0, 1, 1, 0.6), width=2, antialias=True
                 ))
         
-        # Draw roughing (blue)
-        for tp in self._roughing:
-            self._draw_toolpath(tp, (0.3, 0.5, 1, 0.9), cx, cy)
+        # Draw roughing with Z movements (blue cutting, green rapids)
+        self._draw_toolpaths_with_rapids(
+            self._roughing, 
+            cut_color=(0.3, 0.5, 1, 0.9),
+            rapid_color=(0.2, 0.8, 0.2, 0.6),
+            cx=cx, cy=cy
+        )
         
-        # Draw v-bit (orange)
-        for tp in self._vbit:
-            self._draw_toolpath(tp, (1, 0.5, 0.2, 0.9), cx, cy)
+        # Draw v-bit with Z movements (orange cutting, green rapids)
+        self._draw_toolpaths_with_rapids(
+            self._vbit,
+            cut_color=(1, 0.5, 0.2, 0.9),
+            rapid_color=(0.2, 0.8, 0.2, 0.6),
+            cx=cx, cy=cy
+        )
         
         # Draw stock boundary (if set)
         if self._stock_size:
             self._draw_stock_boundary(cx, cy)
+    
+    def _draw_toolpaths_with_rapids(self, toolpaths: list, cut_color: tuple, 
+                                     rapid_color: tuple, cx: float, cy: float):
+        """Draw toolpaths including rapid Z movements between them."""
+        if not toolpaths:
+            return
+        
+        safe_z = self._safe_z
+        last_end_pos = None  # Track end position of previous toolpath
+        
+        for tp in toolpaths:
+            pts = tp.points
+            if len(pts) < 2:
+                continue
+            
+            # Get Z values
+            if pts.shape[1] >= 3:
+                z_vals = pts[:, 2]
+            else:
+                z_vals = np.full(len(pts), tp.z_depth)
+            
+            start_x = pts[0, 0] - cx
+            start_y = pts[0, 1] - cy
+            start_z = z_vals[0]
+            
+            # Draw rapid movements from previous toolpath to this one
+            if last_end_pos is not None:
+                end_x, end_y, end_z = last_end_pos
+                
+                # Retract from previous end position to safe Z
+                retract_pts = np.array([
+                    [end_x, end_y, end_z],
+                    [end_x, end_y, safe_z]
+                ])
+                self.addItem(gl.GLLinePlotItem(
+                    pos=retract_pts, color=rapid_color, width=1, antialias=True
+                ))
+                self._draw_arrow_3d(end_x, end_y, safe_z, 0, 0, 1, rapid_color)  # Up arrow
+                
+                # Rapid XY move at safe Z (if position changed)
+                if abs(end_x - start_x) > 0.01 or abs(end_y - start_y) > 0.01:
+                    rapid_xy_pts = np.array([
+                        [end_x, end_y, safe_z],
+                        [start_x, start_y, safe_z]
+                    ])
+                    self.addItem(gl.GLLinePlotItem(
+                        pos=rapid_xy_pts, color=rapid_color, width=1, antialias=True
+                    ))
+                    # Arrow pointing in direction of travel
+                    dx, dy = start_x - end_x, start_y - end_y
+                    length = np.sqrt(dx*dx + dy*dy)
+                    if length > 0.01:
+                        self._draw_arrow_3d(start_x, start_y, safe_z, 
+                                           dx/length, dy/length, 0, rapid_color)
+                
+                # Plunge to cutting depth
+                plunge_pts = np.array([
+                    [start_x, start_y, safe_z],
+                    [start_x, start_y, start_z]
+                ])
+                self.addItem(gl.GLLinePlotItem(
+                    pos=plunge_pts, color=rapid_color, width=1, antialias=True
+                ))
+                self._draw_arrow_3d(start_x, start_y, start_z, 0, 0, -1, rapid_color)  # Down arrow
+            else:
+                # First toolpath - just show plunge from safe Z
+                plunge_pts = np.array([
+                    [start_x, start_y, safe_z],
+                    [start_x, start_y, start_z]
+                ])
+                self.addItem(gl.GLLinePlotItem(
+                    pos=plunge_pts, color=rapid_color, width=1, antialias=True
+                ))
+                self._draw_arrow_3d(start_x, start_y, start_z, 0, 0, -1, rapid_color)  # Down arrow
+            
+            # Draw the cutting toolpath
+            line_pts = np.column_stack([
+                pts[:, 0] - cx,
+                pts[:, 1] - cy,
+                z_vals
+            ])
+            self.addItem(gl.GLLinePlotItem(
+                pos=line_pts, color=cut_color, width=1.5, antialias=True
+            ))
+            
+            # Add direction arrows along the cutting path
+            self._draw_path_arrows(line_pts, cut_color)
+            
+            # Update last end position
+            last_end_pos = (pts[-1, 0] - cx, pts[-1, 1] - cy, z_vals[-1])
+        
+        # Draw final retract to safe Z
+        if last_end_pos is not None:
+            end_x, end_y, end_z = last_end_pos
+            final_retract = np.array([
+                [end_x, end_y, end_z],
+                [end_x, end_y, safe_z]
+            ])
+            self.addItem(gl.GLLinePlotItem(
+                pos=final_retract, color=rapid_color, width=1, antialias=True
+            ))
+            self._draw_arrow_3d(end_x, end_y, safe_z, 0, 0, 1, rapid_color)  # Up arrow
+    
+    def _draw_arrow_3d(self, x: float, y: float, z: float, 
+                       dx: float, dy: float, dz: float, color: tuple, size: float = 1.0):
+        """Draw a 3D arrow head at position (x,y,z) pointing in direction (dx,dy,dz)."""
+        # Arrow size
+        arrow_len = size
+        arrow_width = size * 0.4
+        
+        # Normalize direction
+        length = np.sqrt(dx*dx + dy*dy + dz*dz)
+        if length < 0.001:
+            return
+        dx, dy, dz = dx/length, dy/length, dz/length
+        
+        # Find perpendicular vectors for arrow wings
+        if abs(dz) < 0.9:
+            perp1 = np.cross([dx, dy, dz], [0, 0, 1])
+        else:
+            perp1 = np.cross([dx, dy, dz], [1, 0, 0])
+        perp1 = perp1 / np.linalg.norm(perp1)
+        perp2 = np.cross([dx, dy, dz], perp1)
+        
+        # Arrow tip is at (x, y, z), base is behind
+        base_x = x - dx * arrow_len
+        base_y = y - dy * arrow_len
+        base_z = z - dz * arrow_len
+        
+        # Create arrow head lines
+        for perp in [perp1, -perp1, perp2, -perp2]:
+            wing_x = base_x + perp[0] * arrow_width
+            wing_y = base_y + perp[1] * arrow_width
+            wing_z = base_z + perp[2] * arrow_width
+            
+            arrow_pts = np.array([
+                [x, y, z],
+                [wing_x, wing_y, wing_z]
+            ])
+            self.addItem(gl.GLLinePlotItem(
+                pos=arrow_pts, color=color, width=1.5, antialias=True
+            ))
+    
+    def _draw_path_arrows(self, line_pts: np.ndarray, color: tuple, 
+                          arrow_spacing: float = 15.0):
+        """Draw direction arrows along a path at regular intervals."""
+        if len(line_pts) < 2:
+            return
+        
+        # Calculate cumulative distance along path
+        diffs = np.diff(line_pts, axis=0)
+        segment_lengths = np.sqrt(np.sum(diffs**2, axis=1))
+        cumulative_dist = np.concatenate([[0], np.cumsum(segment_lengths)])
+        total_length = cumulative_dist[-1]
+        
+        if total_length < arrow_spacing:
+            # Path too short, just put one arrow at midpoint
+            mid_idx = len(line_pts) // 2
+            if mid_idx > 0 and mid_idx < len(line_pts):
+                pos = line_pts[mid_idx]
+                direction = line_pts[mid_idx] - line_pts[mid_idx - 1]
+                length = np.linalg.norm(direction)
+                if length > 0.01:
+                    direction = direction / length
+                    self._draw_arrow_3d(pos[0], pos[1], pos[2],
+                                       direction[0], direction[1], direction[2],
+                                       color, size=0.8)
+            return
+        
+        # Place arrows at regular intervals
+        num_arrows = max(1, int(total_length / arrow_spacing))
+        arrow_positions = np.linspace(arrow_spacing/2, total_length - arrow_spacing/2, num_arrows)
+        
+        for arrow_dist in arrow_positions:
+            # Find which segment this distance falls on
+            seg_idx = np.searchsorted(cumulative_dist, arrow_dist) - 1
+            seg_idx = max(0, min(seg_idx, len(line_pts) - 2))
+            
+            # Interpolate position
+            seg_start_dist = cumulative_dist[seg_idx]
+            seg_length = segment_lengths[seg_idx]
+            if seg_length < 0.001:
+                continue
+            t = (arrow_dist - seg_start_dist) / seg_length
+            t = max(0, min(1, t))
+            
+            pos = line_pts[seg_idx] + t * (line_pts[seg_idx + 1] - line_pts[seg_idx])
+            direction = line_pts[seg_idx + 1] - line_pts[seg_idx]
+            direction = direction / seg_length
+            
+            self._draw_arrow_3d(pos[0], pos[1], pos[2],
+                               direction[0], direction[1], direction[2],
+                               color, size=0.8)
     
     def _draw_toolpath(self, tp, color: tuple, cx: float, cy: float):
         """Draw a single toolpath."""
