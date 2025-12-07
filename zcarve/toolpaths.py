@@ -2527,6 +2527,8 @@ def _generate_vbit_corner_cleanup(
             'depth': corner_depth,
             'angle': corner_angle,
             'bisect': (bisect_x, bisect_y),
+            'edge1': v1,  # Unit vector along edge to previous vertex
+            'edge2': v2,  # Unit vector along edge to next vertex
             'is_sharp': corner_angle < math.pi * 0.7,  # < 126 degrees
         })
     
@@ -2569,17 +2571,364 @@ def _generate_vbit_corner_cleanup(
         )
         toolpaths.extend(arc_toolpaths)
     
-    # Generate corner ramps at deep corners (final cleanup)
+    # Generate corner traces for ALL sharp corners
+    # This creates expanding triangular passes that clean up
+    # the material left by the roughing end mill in corners
     for corner in corner_info:
-        if corner['depth'] > abs(base_depth) * 1.3 and corner['is_sharp']:
-            ramp_paths = _create_diagonal_corner_ramp(
+        if corner['is_sharp']:
+            corner_traces = _generate_corner_trace(
                 corner['x'], corner['y'],
-                corner['depth'], corner['bisect'],
-                tan_half, max_depth
+                corner['depth'], 
+                corner['edge1'], corner['edge2'],
+                corner['angle'], tan_half, tool, polygon,
+                roughing_radius,
             )
-            toolpaths.extend(ramp_paths)
+            toolpaths.extend(corner_traces)
+    
+    # Generate final corner chamfer pass
+    # This traces the perimeter at full depth, ramping up to Z=0 at each corner
+    # to create a chamfered edge that blends the pocket walls with the top surface
+    final_chamfer = _generate_corner_chamfer_pass(
+        coords, corner_info, max_corner_depth, tan_half
+    )
+    if final_chamfer:
+        toolpaths.append(final_chamfer)
     
     return toolpaths
+
+
+def _generate_corner_trace(
+    corner_x: float,
+    corner_y: float,
+    corner_depth: float,
+    edge1: tuple[float, float],
+    edge2: tuple[float, float],
+    corner_angle: float,
+    tan_half_angle: float,
+    tool: VBit,
+    polygon: Polygon,
+    roughing_radius: float = 0.0,
+) -> list[Toolpath]:
+    """Generate V-bit expanding triangle pattern to clean up corner left by roughing.
+    
+    Creates a series of expanding triangular passes that start at the corner apex
+    and progressively expand outward until meeting the area cleared by roughing.
+    
+    Pattern (matching Carveco's approach):
+    1. Small triangle at corner apex
+    2. Slightly larger triangle  
+    3. Continue expanding until reaching roughing boundary
+    4. Arc to blend with perimeter walls
+    
+    All passes are at a fixed Z depth (not ramping), matching how professional
+    V-carving software handles corner cleanup.
+    
+    Args:
+        corner_x, corner_y: The corner vertex position
+        corner_depth: Depth for this corner cleanup pass
+        edge1: Unit vector along first edge (from corner toward prev vertex)
+        edge2: Unit vector along second edge (from corner toward next vertex)
+        corner_angle: The angle of the corner (radians)
+        tan_half_angle: tan(v-bit angle / 2)
+        tool: The V-bit tool
+        polygon: The original polygon (to determine inward direction)
+        roughing_radius: Radius of the roughing end mill (determines cleanup zone size)
+    """
+    import math
+    from shapely.geometry import Point
+    
+    toolpaths = []
+    
+    # Determine inward direction (into the pocket)
+    # The bisector of edge1 and edge2 points either inward or outward
+    # We need to check which direction is inside the polygon
+    bisect_x = edge1[0] + edge2[0]
+    bisect_y = edge1[1] + edge2[1]
+    bisect_len = math.sqrt(bisect_x**2 + bisect_y**2)
+    if bisect_len > 0.01:
+        bisect_x, bisect_y = bisect_x / bisect_len, bisect_y / bisect_len
+    else:
+        # Edges are nearly opposite, use perpendicular to edge1
+        bisect_x, bisect_y = -edge1[1], edge1[0]
+    
+    # Test if bisector points inward or outward
+    test_dist = 0.1
+    test_pt = Point(corner_x + bisect_x * test_dist, corner_y + bisect_y * test_dist)
+    if not polygon.contains(test_pt):
+        # Bisector points outward, flip it
+        bisect_x, bisect_y = -bisect_x, -bisect_y
+    
+    # Offset the corner position inward to match the perimeter offset at this depth
+    # The perimeter is offset by depth * tan(half_angle), and for corners we need
+    # to move along the bisector by offset / cos(corner_angle/2) to reach the 
+    # intersection of the two offset edges
+    perimeter_offset = corner_depth * tan_half_angle
+    half_corner = corner_angle / 2
+    if half_corner > 0.01 and half_corner < math.pi - 0.01:
+        # Distance along bisector to reach the offset corner
+        corner_offset = perimeter_offset / math.sin(half_corner)
+    else:
+        corner_offset = perimeter_offset
+    
+    # Move corner position inward
+    offset_corner_x = corner_x + bisect_x * corner_offset
+    offset_corner_y = corner_y + bisect_y * corner_offset
+    
+    # Calculate the cleanup zone size
+    # The roughing end mill leaves a rounded corner - we need to clean up
+    # from the actual corner out to where the roughing pass reached
+    if roughing_radius > 0.01:
+        # Calculate how far along each edge the roughing couldn't reach
+        half_corner = corner_angle / 2
+        if half_corner > 0.01:
+            # Distance from corner to where roughing circle is tangent to both edges
+            cleanup_distance = roughing_radius / math.sin(half_corner)
+        else:
+            cleanup_distance = roughing_radius * 2
+    else:
+        # No roughing info - use depth-based calculation
+        cleanup_distance = corner_depth / tan_half_angle if tan_half_angle > 0.01 else corner_depth * 2
+    
+    cleanup_distance = min(cleanup_distance, 15.0)  # Cap at 15mm
+    
+    # For corner cleanup, we work INWARD from the corner along the polygon edges
+    # edge1 and edge2 point toward adjacent vertices (along the walls)
+    # The cleanup triangle should be bounded by these edges
+    
+    # Number of expanding triangle passes (Carveco uses about 3-4)
+    step_size = 0.2  # mm between each expanding triangle
+    num_passes = max(3, int(cleanup_distance / step_size))
+    num_passes = min(num_passes, 8)  # Cap number of passes
+    
+    # Generate expanding triangular passes
+    triangle_points = []
+    
+    for pass_idx in range(num_passes):
+        # Calculate the size of this triangle pass
+        # Start small and expand outward along the edges
+        t = (pass_idx + 1) / num_passes
+        pass_distance = cleanup_distance * t
+        
+        # Points along each edge at this distance from the OFFSET corner
+        # These are along the polygon walls (edge1/edge2 point toward adjacent vertices)
+        p1_x = offset_corner_x + edge1[0] * pass_distance
+        p1_y = offset_corner_y + edge1[1] * pass_distance
+        
+        p2_x = offset_corner_x + edge2[0] * pass_distance
+        p2_y = offset_corner_y + edge2[1] * pass_distance
+        
+        # For the first (smallest) triangle, start near the offset corner
+        if pass_idx == 0:
+            # Start position - at the offset corner itself (or very close)
+            start_offset = step_size * 0.3
+            start_x = offset_corner_x + edge1[0] * start_offset
+            start_y = offset_corner_y + edge1[1] * start_offset
+            triangle_points.append([start_x, start_y])
+            
+            # Move to offset corner
+            triangle_points.append([offset_corner_x, offset_corner_y])
+            
+            # Move to edge2 start
+            start_x2 = offset_corner_x + edge2[0] * start_offset
+            start_y2 = offset_corner_y + edge2[1] * start_offset
+            triangle_points.append([start_x2, start_y2])
+        
+        # Triangle pattern for this pass:
+        # From edge2 point -> corner -> edge1 point
+        # Then back to edge2 for next expansion
+        
+        # Move to point on edge1
+        triangle_points.append([p1_x, p1_y])
+        
+        # Move to offset corner (the apex of the triangle)
+        triangle_points.append([offset_corner_x, offset_corner_y])
+        
+        # Move to point on edge2
+        triangle_points.append([p2_x, p2_y])
+    
+    # Final arc to blend with perimeter (outside the corner, connecting the two edges)
+    if len(triangle_points) >= 2 and cleanup_distance > 0.5:
+        arc_points = _generate_corner_blend_arc(
+            offset_corner_x, offset_corner_y,
+            edge1, edge2,
+            cleanup_distance,
+            corner_angle,
+        )
+        triangle_points.extend(arc_points)
+    
+    if len(triangle_points) >= 2:
+        toolpaths.append(Toolpath(
+            points=np.array(triangle_points),
+            z_depth=-corner_depth,
+            is_rapid=False,
+        ))
+    
+    return toolpaths
+
+
+def _generate_corner_blend_arc(
+    corner_x: float,
+    corner_y: float,
+    edge1: tuple[float, float],
+    edge2: tuple[float, float],
+    radius: float,
+    corner_angle: float,
+    num_segments: int = 8,
+) -> list[list[float]]:
+    """Generate arc points to blend corner cleanup with perimeter walls.
+    
+    Creates a smooth arc that connects the corner cleanup triangles
+    to the straight perimeter walls, similar to G2/G3 arcs in Carveco output.
+    """
+    import math
+    
+    points = []
+    
+    # Arc sweeps from edge2 direction around to edge1 direction
+    # The arc center is at the corner, radius is the cleanup distance
+    
+    # Calculate angles for edge vectors
+    angle1 = math.atan2(edge1[1], edge1[0])
+    angle2 = math.atan2(edge2[1], edge2[0])
+    
+    # Determine sweep direction (always go the "outside" way around the corner)
+    # For an inside corner, we want to arc through the exterior
+    angle_diff = angle1 - angle2
+    while angle_diff > math.pi:
+        angle_diff -= 2 * math.pi
+    while angle_diff < -math.pi:
+        angle_diff += 2 * math.pi
+    
+    # Generate arc points
+    for i in range(num_segments + 1):
+        t = i / num_segments
+        angle = angle2 + angle_diff * t
+        
+        px = corner_x + math.cos(angle) * radius
+        py = corner_y + math.sin(angle) * radius
+        points.append([px, py])
+    
+    return points
+
+
+def _generate_corner_chamfer_pass(
+    coords: list[tuple[float, float]],
+    corner_info: list[dict],
+    max_depth: float,
+    tan_half_angle: float,
+) -> Toolpath | None:
+    """Generate final corner chamfer pass.
+    
+    This traces the perimeter at full depth, ramping up to Z=0 at each corner
+    to create a chamfered edge that blends the pocket walls with the top surface.
+    
+    Pattern from Carveco:
+    - Start at offset corner at full depth
+    - Ramp up to Z=0 at original corner position
+    - Ramp back down to full depth at next offset corner
+    - Continue around perimeter
+    
+    Args:
+        coords: Original polygon coordinates (corners)
+        corner_info: List of corner info dicts with position, depth, angle, bisect
+        max_depth: Maximum cutting depth
+        tan_half_angle: tan(v-bit angle / 2)
+    """
+    import math
+    
+    if len(coords) < 3 or len(corner_info) < 3:
+        return None
+    
+    # Calculate offset for max depth
+    perimeter_offset = max_depth * tan_half_angle
+    
+    chamfer_points = []
+    
+    for i, corner in enumerate(corner_info):
+        corner_x = corner['x']
+        corner_y = corner['y']
+        corner_angle = corner['angle']
+        
+        # Calculate inward bisector direction
+        edge1 = corner['edge1']
+        edge2 = corner['edge2']
+        bisect_x = edge1[0] + edge2[0]
+        bisect_y = edge1[1] + edge2[1]
+        bisect_len = math.sqrt(bisect_x**2 + bisect_y**2)
+        if bisect_len > 0.01:
+            bisect_x, bisect_y = bisect_x / bisect_len, bisect_y / bisect_len
+        else:
+            bisect_x, bisect_y = -edge1[1], edge1[0]
+        
+        # Determine if bisector points inward (we need inward direction)
+        # Use the stored bisect direction which was already computed
+        # The stored bisect points outward (toward exterior), so use it directly
+        # since we want to move toward the interior of the pocket
+        bisect_stored = corner['bisect']
+        # The bisector points along the corner diagonal - for inward offset
+        # we actually want to go in the same direction as the bisector
+        # (which points into the corner, i.e., toward the pocket interior)
+        inward_x, inward_y = bisect_stored[0], bisect_stored[1]
+        
+        # Calculate offset distance along bisector
+        half_corner = corner_angle / 2
+        if half_corner > 0.01 and half_corner < math.pi - 0.01:
+            corner_offset_dist = perimeter_offset / math.sin(half_corner)
+        else:
+            corner_offset_dist = perimeter_offset
+        
+        # Offset corner position (at full depth)
+        offset_x = corner_x + inward_x * corner_offset_dist
+        offset_y = corner_y + inward_y * corner_offset_dist
+        
+        # Add points for this corner:
+        # 1. (If not first) Travel from previous offset corner to this offset corner at full depth
+        # 2. Ramp up to original corner at Z=0
+        # 3. Ramp back down to this offset corner at full depth
+        
+        if i == 0:
+            # First point - start at offset corner at full depth
+            chamfer_points.append([offset_x, offset_y, -max_depth])
+        else:
+            # Travel along edge from previous offset corner to this offset corner
+            # (This point is at full depth, continuing from previous ramp-down)
+            chamfer_points.append([offset_x, offset_y, -max_depth])
+        
+        # Ramp up to original corner at Z=0
+        chamfer_points.append([corner_x, corner_y, 0.0])
+        
+        # Ramp back down to offset corner at full depth
+        chamfer_points.append([offset_x, offset_y, -max_depth])
+    
+    # Close the loop - travel back to first offset corner, then do final ramp
+    if len(chamfer_points) >= 3:
+        first_corner = corner_info[0]
+        corner_x = first_corner['x']
+        corner_y = first_corner['y']
+        corner_angle = first_corner['angle']
+        bisect_stored = first_corner['bisect']
+        inward_x, inward_y = bisect_stored[0], bisect_stored[1]
+        
+        half_corner = corner_angle / 2
+        if half_corner > 0.01 and half_corner < math.pi - 0.01:
+            corner_offset_dist = perimeter_offset / math.sin(half_corner)
+        else:
+            corner_offset_dist = perimeter_offset
+        
+        offset_x = corner_x + inward_x * corner_offset_dist
+        offset_y = corner_y + inward_y * corner_offset_dist
+        
+        # Travel along final edge back to first offset corner
+        chamfer_points.append([offset_x, offset_y, -max_depth])
+    
+    if len(chamfer_points) >= 2:
+        return Toolpath(
+            points=np.array(chamfer_points),
+            z_depth=-max_depth,
+            is_rapid=False,
+        )
+    
+    return None
 
 
 def _generate_arc_perimeter(
